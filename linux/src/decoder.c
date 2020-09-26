@@ -36,7 +36,8 @@ struct spx_decoder_s {
 struct jpg_dec_ctx_s {
  int invert;
  int subsamp;
- int m_width, m_height;
+ int m_width, m_height; // stream WxH
+ int d_width, d_height; // decoded WxH (can be inverted)
  int m_Yuv420Size, m_ySize, m_uvSize;
  int m_webcamYuvSize, m_webcam_ySize, m_webcam_uvSize;;
  size_t m_BufferLimit;
@@ -106,7 +107,7 @@ int decoder_init(void) {
     jpg_decoder.tj = NULL;
     jpg_decoder.tjXform = NULL;
     jpg_decoder.invert = (WEBCAM_W < WEBCAM_H);
-    jpg_decoder.transform.op = TJXOP_ROT90;
+    jpg_decoder.transform.op = 0;
     jpg_decoder.transform.options = TJXOPT_COPYNONE | TJXOPT_TRIM;
     jpg_decoder.m_BufferLimit = 0;
     jpg_decoder.m_webcamYuvSize  = WEBCAM_W * WEBCAM_H * 3 / 2;
@@ -170,12 +171,20 @@ int decoder_prepare_video(char * header) {
         return FALSE;
     }
 
+    jpg_decoder.tjXform = tjInitTransform();
+    if (!jpg_decoder.tjXform) {
+        MSG_ERROR("Error creating transform!");
+        return FALSE;
+    }
+
     if (jpg_decoder.invert) {
-        jpg_decoder.tjXform = tjInitTransform();
-        if (!jpg_decoder.tjXform) {
-            MSG_ERROR("Error creating transform!");
-            return FALSE;
-        }
+        jpg_decoder.d_width = jpg_decoder.m_height;
+        jpg_decoder.d_height = jpg_decoder.m_width;
+        jpg_decoder.transform.op = TJXOP_ROT90;
+
+    } else {
+        jpg_decoder.d_width = jpg_decoder.m_width;
+        jpg_decoder.d_height = jpg_decoder.m_height;
     }
 
     dbgprint("Stream W=%d H=%d\n", jpg_decoder.m_width, jpg_decoder.m_height);
@@ -189,18 +198,12 @@ int decoder_prepare_video(char * header) {
     if (jpg_decoder.m_webcamYuvSize != jpg_decoder.m_Yuv420Size) {
         jpg_decoder.m_webcamBuf = (BYTE*)malloc(jpg_decoder.m_webcamYuvSize * sizeof(BYTE));
         jpg_decoder.swc = sws_getCachedContext(NULL,
-                jpg_decoder.m_width, jpg_decoder.m_height, AV_PIX_FMT_YUV420P, /* src */
+                jpg_decoder.d_width, jpg_decoder.d_height, AV_PIX_FMT_YUV420P, /* src */
                 WEBCAM_W, WEBCAM_H , AV_PIX_FMT_YUV420P, /* dst */
                 SWS_FAST_BILINEAR /* flags */, NULL, NULL, NULL);
 
-        int srcLen, dstLen;
-        if (jpg_decoder.invert){
-            srcLen = jpg_decoder.m_height;
-            dstLen = WEBCAM_H;
-        } else {
-            srcLen = jpg_decoder.m_width;
-            dstLen = WEBCAM_W;
-        }
+        int srcLen = jpg_decoder.d_width;
+        int dstLen = WEBCAM_W;
 
         jpg_decoder.swcSrcStride[0] = srcLen;
         jpg_decoder.swcSrcStride[1] = srcLen>>1;
@@ -234,15 +237,15 @@ int decoder_prepare_video(char * header) {
         recieveQueue.add_item(&jpg_frames[i]);
     }
 
-    int stride = (jpg_decoder.invert) ? jpg_decoder.m_height : jpg_decoder.m_width;
+    int stride = jpg_decoder.d_width;
     jpg_decoder.tjDstStride[0] = stride;
     jpg_decoder.tjDstStride[1] = stride>>1;
     jpg_decoder.tjDstStride[2] = stride>>1;
     jpg_decoder.tjDstStride[3] = 0;
 
     jpg_decoder.tjDstSlice[0] = jpg_decoder.m_decodeBuf;
-    jpg_decoder.tjDstSlice[1] = jpg_decoder.dstSlice[0] + jpg_decoder.m_ySize;
-    jpg_decoder.tjDstSlice[2] = jpg_decoder.dstSlice[1] + jpg_decoder.m_uvSize;
+    jpg_decoder.tjDstSlice[1] = jpg_decoder.tjDstSlice[0] + jpg_decoder.m_ySize;
+    jpg_decoder.tjDstSlice[2] = jpg_decoder.tjDstSlice[1] + jpg_decoder.m_uvSize;
     jpg_decoder.tjDstSlice[3] = NULL;
 
     return TRUE;
@@ -293,30 +296,20 @@ void process_frame(JPGFrame *frame) {
         jpg_decoder.subsamp = subsamp;
     }
 
-    if (jpg_decoder.invert) {
-        if (tjTransform(tjHandle, p, len, 1, &p, &len, &jpg_decoder.transform, 0)) {
+    if (jpg_decoder.transform.op) {
+        if (tjTransform(jpg_decoder.tjXform, p, len, 1, &p, &len, &jpg_decoder.transform, 0)) {
             errprint("tjTransform failure: %s\n", tjGetErrorStr());
             return;
         }
-
-        if (tjDecompressToYUVPlanes(jpg_decoder.tj, p, len,
-            jpg_decoder.tjDstSlice, jpg_decoder.m_height,
-            jpg_decoder.tjDstStride, jpg_decoder.m_width,
-            TJFLAG_FASTDCT | TJFLAG_FASTUPSAMPLE))
-        {
-            errprint("inverted tjDecompressToYUV2 failure: %d\n", tjGetErrorCode(jpg_decoder.tj));
-            return;
-        }
     }
-    else {
-        if (tjDecompressToYUVPlanes(jpg_decoder.tj, p, len,
-            jpg_decoder.tjDstSlice, jpg_decoder.m_width,
-            jpg_decoder.tjDstStride, jpg_decoder.m_height,
+
+    if (tjDecompressToYUVPlanes(jpg_decoder.tj, p, len,
+            jpg_decoder.tjDstSlice, jpg_decoder.d_width,
+            jpg_decoder.tjDstStride, jpg_decoder.d_height,
             TJFLAG_FASTDCT | TJFLAG_FASTUPSAMPLE))
-        {
-            errprint("tjDecompressToYUV2 failure: %d\n", tjGetErrorCode(jpg_decoder.tj));
-            return;
-        }
+    {
+        errprint("tjDecompressToYUV2 failure: %d\n", tjGetErrorCode(jpg_decoder.tj));
+        return;
     }
 
     decoder_share_frame();
@@ -330,7 +323,7 @@ static void decoder_share_frame() {
             (const uint8_t * const*) jpg_decoder.swcSrcSlice,
             jpg_decoder.swcSrcStride,
             0,
-            jpg_decoder.m_height,
+            jpg_decoder.d_height,
             jpg_decoder.swcDstSlice,
             jpg_decoder.swcDstStride);
 
@@ -402,11 +395,11 @@ int decoder_get_video_height() {
 }
 
 void decoder_horizontal_flip() {
-    if ((jpg_decoder.transfer.op & TJXOP_HFLIP) == 0) {
-        jpg_decoder.transfer.op |= TJXOP_HFLIP;
+    if ((jpg_decoder.transform.op & TJXOP_HFLIP) == 0) {
+        jpg_decoder.transform.op |= TJXOP_HFLIP;
         dbgprint("hflip enabled");
     } else {
-        jpg_decoder.transfer.op &= (~TJXOP_HFLIP);
+        jpg_decoder.transform.op &= (~TJXOP_HFLIP);
         dbgprint("hflip disabled");
     }
 }

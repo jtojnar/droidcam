@@ -168,6 +168,10 @@ void wait_command() {
             case 'L':
                 thread_cmd = (CB_CONTROL_LED-10);
                 break;
+            case 'f':
+            case 'F':
+                decoder_horizontal_flip();
+                break;
         }
     }
 }
